@@ -12,6 +12,18 @@
 go get -u github.com/pinpt/rdsmysql
 ```
 
+## Overview
+
+The goal of this driver is to support Amazon RDS load balancing for MySQL and is most effective when RDS is configured to auto scale in and out.
+
+Queries are transparently split to the master vs the replica based on the method used against the sql.DB.
+
+All `Exec`, `ExecContext` or `Begin` transactions will be issued against the master host.
+
+All `Query`, `QueryRow`, `QueryContext`, `QueryRowContext` queries will be issued against a replica picked at random (if more than 1 replica available).
+
+When the Database is opened, the driver will (in the background) monitor replica changes in RDS using the information_schema.replica_host_status table.  When RDS is setup to auto scale in and out, the driver will keep track of these changes and load balance queries across them as the replicas change.  If no replica is available, the master host will be used instead.
+
 ## Usage
 
 Use it like a normal MySQL driver except instead of `mysql` use `rdsmysql` and use the `hostname` to the RDS cluster as the url.
