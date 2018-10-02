@@ -267,8 +267,7 @@ func (c *connection) getConnection(hostname string) (driver.Conn, error) {
 		}
 		c.args.Set("tls", profile)
 	}
-	pass, _ := c.userinfo.Password()
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", c.userinfo.Username(), pass, hostname, c.port, c.database, c.args.Encode())
+	dsn := fmt.Sprintf("%s@tcp(%s:%d)/%s?%s", c.userinfo.String(), hostname, c.port, c.database, c.args.Encode())
 	L.Log("msg", "getting connection", "hostname", hostname, "dsn", dsn)
 	return mysqlDriver.Open(dsn)
 }

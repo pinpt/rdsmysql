@@ -3,6 +3,7 @@ package rdsmysql
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"testing"
 )
 
@@ -52,6 +53,20 @@ func TestDriver(t *testing.T) {
 			t.Fatal("should have returned a value")
 		}
 	}
+}
+
+func TestDriverPasswordEscape(t *testing.T) {
+	up := url.UserPassword("foo", "xZ{G{V?X-R:y%l")
+	db, err := sql.Open(DriverName, up.String()+"@localhost/mysql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	_, err = db.Query("select now()")
+	if err == nil {
+		t.Fatal("should have been an error")
+	}
+	assertEq(t, "Error 1045: Access denied for user 'foo'@'localhost' (using password: YES)", err.Error())
 }
 
 func TestGetReplicaHostname(t *testing.T) {
