@@ -497,7 +497,10 @@ func (c *connection) ResetSession(ctx context.Context) error {
 // As of Go 1.1, a Stmt will not be closed if it's in use
 // by any queries.
 func (s *statement) Close() error {
-	return s.parent.Close()
+	if s.parent != nil {
+		return s.parent.Close()
+	}
+	return nil
 }
 
 // NumInput returns the number of placeholder parameters.
