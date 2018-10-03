@@ -267,7 +267,16 @@ func (c *connection) getConnection(hostname string) (driver.Conn, error) {
 		}
 		c.args.Set("tls", profile)
 	}
-	dsn := fmt.Sprintf("%s@tcp(%s:%d)/%s?%s", c.userinfo.String(), hostname, c.port, c.database, c.args.Encode())
+	cfg := mysql.NewConfig()
+	cfg.Net = "tcp"
+	cfg.Addr = fmt.Sprintf("%s:%d", hostname, c.port)
+	cfg.User = c.userinfo.Username()
+	pass, ok := c.userinfo.Password()
+	if ok {
+		cfg.Passwd = pass
+	}
+	cfg.DBName = c.database
+	dsn := cfg.FormatDSN() + "?" + c.args.Encode()
 	L.Log("msg", "getting connection", "hostname", hostname, "dsn", dsn)
 	return mysqlDriver.Open(dsn)
 }
