@@ -97,6 +97,7 @@ type statement struct {
 	query  string
 	conn   *connection
 	parent driver.Stmt
+	ctx    context.Context
 }
 
 // make sure our statement implements the full driver.Stmt interface
@@ -250,34 +251,39 @@ func (c *connection) setupTopologyTicker() {
 	}()
 }
 
-func (c *connection) getConnection(hostname string) (driver.Conn, error) {
+// GetDSN is a helper for getting the DSN to mysql
+func GetDSN(hostname string, port int, username string, password string, name string, args url.Values) (string, error) {
 	if strings.Contains(hostname, "rds.amazonaws.com") {
 		caCertPool := x509.NewCertPool()
 		if !caCertPool.AppendCertsFromPEM([]byte(mysqlRDSCACert)) {
-			return nil, fmt.Errorf("can't add RDS TLS certs")
+			return "", fmt.Errorf("can't add RDS TLS certs")
 		}
 		config := &tls.Config{
 			ServerName: hostname,
 			RootCAs:    caCertPool,
 		}
-		profile := hex.EncodeToString([]byte(c.hostname))
+		profile := hex.EncodeToString([]byte(hostname))
 		err := mysql.RegisterTLSConfig(profile, config)
 		if err != nil {
-			panic(err)
+			return "", err
 		}
-		c.args.Set("tls", profile)
+		args.Set("tls", profile)
 	}
 	cfg := mysql.NewConfig()
 	cfg.Net = "tcp"
-	cfg.Addr = fmt.Sprintf("%s:%d", hostname, c.port)
-	cfg.User = c.userinfo.Username()
-	pass, ok := c.userinfo.Password()
-	if ok {
-		cfg.Passwd = pass
+	cfg.Addr = fmt.Sprintf("%s:%d", hostname, port)
+	cfg.User = username
+	cfg.Passwd = password
+	cfg.DBName = name
+	return cfg.FormatDSN() + "?" + args.Encode(), nil
+}
+
+func (c *connection) getConnection(hostname string) (driver.Conn, error) {
+	pass, _ := c.userinfo.Password()
+	dsn, err := GetDSN(hostname, c.port, c.userinfo.Username(), pass, c.database, c.args)
+	if err != nil {
+		return nil, err
 	}
-	cfg.DBName = c.database
-	dsn := cfg.FormatDSN() + "?" + c.args.Encode()
-	L.Log("msg", "getting connection", "hostname", hostname, "dsn", dsn)
 	return mysqlDriver.Open(dsn)
 }
 
@@ -423,7 +429,11 @@ func (c *connection) getReplica() (driver.Conn, string, error) {
 
 // Prepare returns a prepared statement, bound to this connection.
 func (c *connection) Prepare(query string) (driver.Stmt, error) {
-	return &statement{query, c, nil}, nil
+	return &statement{query, c, nil, context.Background()}, nil
+}
+
+func (c *connection) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	return &statement{query, c, nil, ctx}, nil
 }
 
 // Close invalidates and potentially stops any current
@@ -492,6 +502,39 @@ func (c *connection) ResetSession(ctx context.Context) error {
 	return driver.ErrBadConn
 }
 
+func (c *connection) Ping(ctx context.Context) error {
+	conn, err := c.getMaster()
+	if err != nil {
+		return err
+	}
+	if p, ok := conn.(driver.Pinger); ok {
+		return p.Ping(ctx)
+	}
+	return nil
+}
+
+func (c *connection) Exec(query string, args []driver.Value) (driver.Result, error) {
+	conn, err := c.getMaster()
+	if err != nil {
+		return nil, err
+	}
+	if mc, ok := conn.(driver.Execer); ok {
+		return mc.Exec(query, args)
+	}
+	return nil, fmt.Errorf("unknown error")
+}
+
+func (c *connection) ExecContext(ctx context.Context, query string, nargs []driver.NamedValue) (driver.Result, error) {
+	conn, err := c.getMaster()
+	if err != nil {
+		return nil, err
+	}
+	if mc, ok := conn.(driver.ExecerContext); ok {
+		return mc.ExecContext(ctx, query, nargs)
+	}
+	return nil, fmt.Errorf("unknown error")
+}
+
 // Close closes the statement.
 //
 // As of Go 1.1, a Stmt will not be closed if it's in use
@@ -532,7 +575,12 @@ func (s *statement) Query(args []driver.Value) (driver.Rows, error) {
 			}
 			return nil, err
 		}
-		st, err := conn.Prepare(s.query)
+		var st driver.Stmt
+		if cp, ok := conn.(driver.ConnPrepareContext); ok {
+			st, err = cp.PrepareContext(s.ctx, s.query)
+		} else {
+			st, err = conn.Prepare(s.query)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -577,7 +625,12 @@ func (s *statement) QueryContext(ctx context.Context, nargs []driver.NamedValue)
 			}
 			return nil, err
 		}
-		st, err := conn.Prepare(s.query)
+		var st driver.Stmt
+		if cp, ok := conn.(driver.ConnPrepareContext); ok {
+			st, err = cp.PrepareContext(s.ctx, s.query)
+		} else {
+			st, err = conn.Prepare(s.query)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -611,7 +664,12 @@ func (s *statement) Exec(args []driver.Value) (driver.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	st, err := conn.Prepare(s.query)
+	var st driver.Stmt
+	if cp, ok := conn.(driver.ConnPrepareContext); ok {
+		st, err = cp.PrepareContext(s.ctx, s.query)
+	} else {
+		st, err = conn.Prepare(s.query)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -640,7 +698,12 @@ func (s *statement) ExecContext(ctx context.Context, nargs []driver.NamedValue) 
 	if err != nil {
 		return nil, err
 	}
-	st, err := conn.Prepare(s.query)
+	var st driver.Stmt
+	if cp, ok := conn.(driver.ConnPrepareContext); ok {
+		st, err = cp.PrepareContext(s.ctx, s.query)
+	} else {
+		st, err = conn.Prepare(s.query)
+	}
 	if err != nil {
 		return nil, err
 	}

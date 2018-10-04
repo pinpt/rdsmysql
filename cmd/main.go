@@ -38,9 +38,11 @@ func (l *logger) Log(keyvals ...interface{}) error {
 }
 
 var debug bool
+var exec bool
 
 func init() {
 	flag.BoolVar(&debug, "debug", false, "turn on debug logging")
+	flag.BoolVar(&exec, "exec", false, "use exec instead of query")
 }
 
 func main() {
@@ -59,36 +61,46 @@ func main() {
 		os.Exit(1)
 	}
 	defer db.Close()
-	rows, err := db.Query(args[1])
-	if err != nil && err != sql.ErrNoRows {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	defer rows.Close()
-	cols, err := rows.Columns()
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	for _, col := range cols {
-		fmt.Print(col, "\t")
-	}
-	fmt.Println()
-	fmt.Println(strings.Repeat("-", 120))
-	for rows.Next() {
-		vals := make([]interface{}, 0)
-		for i := 0; i < len(cols); i++ {
-			var s sql.NullString
-			vals = append(vals, &s)
-		}
-		if err := rows.Scan(vals...); err != nil {
-			fmt.Println("error scanning rows: ", err)
+	if exec {
+		r, err := db.Exec(args[1])
+		if err != nil {
+			fmt.Println(err)
 			os.Exit(1)
 		}
-		for _, val := range vals {
-			s := val.(*sql.NullString)
-			fmt.Print(s.String, "\t")
+		rows, _ := r.RowsAffected()
+		fmt.Printf("%d rows affected\n", rows)
+	} else {
+		rows, err := db.Query(args[1])
+		if err != nil && err != sql.ErrNoRows {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		defer rows.Close()
+		cols, err := rows.Columns()
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		for _, col := range cols {
+			fmt.Print(col, "\t")
 		}
 		fmt.Println()
+		fmt.Println(strings.Repeat("-", 120))
+		for rows.Next() {
+			vals := make([]interface{}, 0)
+			for i := 0; i < len(cols); i++ {
+				var s sql.NullString
+				vals = append(vals, &s)
+			}
+			if err := rows.Scan(vals...); err != nil {
+				fmt.Println("error scanning rows: ", err)
+				os.Exit(1)
+			}
+			for _, val := range vals {
+				s := val.(*sql.NullString)
+				fmt.Print(s.String, "\t")
+			}
+			fmt.Println()
+		}
 	}
 }
