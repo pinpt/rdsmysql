@@ -49,6 +49,9 @@ var ErrConnectMaxRetriesExceeded = errors.New("tried MaxServersTriedForQuery ser
 // ErrExecMaxRetriesExceeded is returned after exhausting a retryable query
 var ErrExecMaxRetriesExceeded = errors.New("max retries exceeded for retryable error")
 
+// ErrUnsupportedMethod is returned for an unsupported method that is invoked against the underlying driver
+var ErrUnsupportedMethod = errors.New("unsupported method")
+
 // MaxServersTriedForQuery is the max number of servers tried for a query. The actual number of retries is +1 since it tries to connect to initial instance twice.
 const MaxServersTriedForQuery = 3
 
@@ -120,6 +123,15 @@ var DefaultDriverOpts = url.Values{
 	"parseTime":  {"true"},
 	"autocommit": {"true"},
 }
+
+// TrackedConn is an interface that the conn implementation returned from the Open
+// returns to allow it to be terminated
+type TrackedConn interface {
+	// Terminate will forceably shutdown the connection and close all db
+	Terminate()
+}
+
+var _ TrackedConn = (*connection)(nil)
 
 // Open returns a new connection to the database.
 // The name is a string in a driver-specific format.
@@ -198,7 +210,11 @@ func (d *db) Open(name string) (driver.Conn, error) {
 			}
 			go func(db driver.Conn) {
 				// do not block
-				db.Close()
+				if d, ok := db.(TrackedConn); ok {
+					d.Terminate()
+				} else {
+					db.Close()
+				}
 			}(conn.connections[id])
 			delete(conn.connections, id)
 		},
@@ -215,8 +231,26 @@ func (d *db) Open(name string) (driver.Conn, error) {
 	return conn, nil
 }
 
+// Terminate will forceably shutdown the connection and close all db
+func (c *connection) Terminate() {
+	L.Log("msg", "terminate", "hostname", c.hostname)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.topologyUpdates.Stop()
+	globalTopologyLock.Lock()
+	globalTopologyRetrievalLock.Lock()
+	defer globalTopologyLock.Unlock()
+	defer globalTopologyRetrievalLock.Lock()
+	delete(globalTopologyMap, c.hostname)
+	for k, conn := range c.connections {
+		delete(globalTopologyMap, k)
+		conn.Close()
+	}
+	c.connections = nil
+}
+
 func (c *connection) updateTopology() error {
-	L.Log("msg", "update topology called")
+	L.Log("msg", "update topology called", "hostname", c.hostname)
 	conn, err := c.getConnection(c.hostname)
 	if err != nil {
 		return err
@@ -227,7 +261,7 @@ func (c *connection) updateTopology() error {
 		return err
 	}
 	c.mu.Lock()
-	c.topology.SetAvailableFromReplicaHostStatus(res)
+	c.topology.SetAvailableFromReplicaHostStatus(c.hostname, res)
 	c.mu.Unlock()
 	return nil
 }
@@ -304,6 +338,7 @@ func (c *connection) getReplicaHostname(serverid string) (string, error) {
 }
 
 func (c *connection) retrieveTopology(conn driver.Conn) ([]string, error) {
+	// TODO: look into only running one of these to service all connections instead of N per connection
 	L.Log("msg", "retrieve topology called")
 	// find all the replicas
 	q := fmt.Sprintf(`
@@ -345,20 +380,36 @@ func (c *connection) retrieveTopology(conn driver.Conn) ([]string, error) {
 	return res, nil
 }
 
+var globalTopologyLock sync.RWMutex
+var globalTopologyRetrievalLock sync.Mutex
+var globalTopologyMap map[string][]string
+
 // updateTopologyInitial will fetch the initial topology
 func (c *connection) updateTopologyInitial() error {
+	// first check the global topology map so we can share them
+	globalTopologyLock.RLock()
+	found, ok := globalTopologyMap[c.hostname]
+	if ok {
+		globalTopologyLock.RUnlock()
+		c.topology.SetAvailableFromReplicaHostStatus(c.hostname, found)
+		return nil
+	}
+	globalTopologyLock.RUnlock()
 	conn, err := c.getConnection(c.hostname)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	globalTopologyRetrievalLock.Lock()
+	defer globalTopologyRetrievalLock.Unlock()
 	res, err := c.retrieveTopology(conn)
 	if err != nil {
 		return err
 	}
 	c.mu.Lock()
-	L.Log("msg", "updating topology initial", "servers", res)
-	c.topology.SetAvailableFromReplicaHostStatus(res)
+	L.Log("msg", "updating topology initial", "servers", res, "hostname", c.hostname)
+	c.topology.SetAvailableFromReplicaHostStatus(c.hostname, res)
+	globalTopologyMap[c.hostname] = res
 	c.mu.Unlock()
 	return nil
 }
@@ -445,14 +496,7 @@ func (c *connection) PrepareContext(ctx context.Context, query string) (driver.S
 // idle connections, it shouldn't be necessary for drivers to
 // do their own connection caching.
 func (c *connection) Close() error {
-	L.Log("msg", "close", "hostname", c.hostname)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.topologyUpdates.Stop()
-	for _, conn := range c.connections {
-		conn.Close()
-	}
-	c.connections = nil
+	// don't shutdown the connection, we'll internally handle it
 	return nil
 }
 
@@ -502,6 +546,13 @@ func (c *connection) ResetSession(ctx context.Context) error {
 	return driver.ErrBadConn
 }
 
+// Pinger is an optional interface that may be implemented by a Conn.
+//
+// If a Conn does not implement Pinger, the sql package's DB.Ping and
+// DB.PingContext will check if there is at least one Conn available.
+//
+// If Conn.Ping returns ErrBadConn, DB.Ping and DB.PingContext will remove
+// the Conn from pool.
 func (c *connection) Ping(ctx context.Context) error {
 	conn, err := c.getMaster()
 	if err != nil {
@@ -510,9 +561,18 @@ func (c *connection) Ping(ctx context.Context) error {
 	if p, ok := conn.(driver.Pinger); ok {
 		return p.Ping(ctx)
 	}
-	return nil
+	return ErrUnsupportedMethod
 }
 
+// Execer is an optional interface that may be implemented by a Conn.
+//
+// If a Conn implements neither ExecerContext nor Execer Execer,
+// the sql package's DB.Exec will first prepare a query, execute the statement,
+// and then close the statement.
+//
+// Exec may return ErrSkip.
+//
+// Deprecated: Drivers should implement ExecerContext instead.
 func (c *connection) Exec(query string, args []driver.Value) (driver.Result, error) {
 	conn, err := c.getMaster()
 	if err != nil {
@@ -521,9 +581,19 @@ func (c *connection) Exec(query string, args []driver.Value) (driver.Result, err
 	if mc, ok := conn.(driver.Execer); ok {
 		return mc.Exec(query, args)
 	}
-	return nil, fmt.Errorf("unknown error")
+	return nil, ErrUnsupportedMethod
 }
 
+// ExecerContext is an optional interface that may be implemented by a Conn.
+//
+// If a Conn does not implement ExecerContext, the sql package's DB.Exec
+// will fall back to Execer; if the Conn does not implement Execer either,
+// DB.Exec will first prepare a query, execute the statement, and then
+// close the statement.
+//
+// ExecerContext may return ErrSkip.
+//
+// ExecerContext must honor the context timeout and return when the context is canceled.
 func (c *connection) ExecContext(ctx context.Context, query string, nargs []driver.NamedValue) (driver.Result, error) {
 	conn, err := c.getMaster()
 	if err != nil {
@@ -532,7 +602,48 @@ func (c *connection) ExecContext(ctx context.Context, query string, nargs []driv
 	if mc, ok := conn.(driver.ExecerContext); ok {
 		return mc.ExecContext(ctx, query, nargs)
 	}
-	return nil, fmt.Errorf("unknown error")
+	return nil, ErrUnsupportedMethod
+}
+
+// Queryer is an optional interface that may be implemented by a Conn.
+//
+// If a Conn implements neither QueryerContext nor Queryer,
+// the sql package's DB.Query will first prepare a query, execute the statement,
+// and then close the statement.
+//
+// Query may return ErrSkip.
+//
+// Deprecated: Drivers should implement QueryerContext instead.
+func (c *connection) Query(query string, args []driver.Value) (driver.Rows, error) {
+	conn, _, err := c.getReplica()
+	if err != nil {
+		return nil, err
+	}
+	if s, ok := conn.(driver.Queryer); ok {
+		return s.Query(query, args)
+	}
+	return nil, ErrUnsupportedMethod
+}
+
+// QueryerContext is an optional interface that may be implemented by a Conn.
+//
+// If a Conn does not implement QueryerContext, the sql package's DB.Query
+// will fall back to Queryer; if the Conn does not implement Queryer either,
+// DB.Query will first prepare a query, execute the statement, and then
+// close the statement.
+//
+// QueryerContext may return ErrSkip.
+//
+// QueryerContext must honor the context timeout and return when the context is canceled.
+func (c *connection) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	conn, _, err := c.getReplica()
+	if err != nil {
+		return nil, err
+	}
+	if s, ok := conn.(driver.QueryerContext); ok {
+		return s.QueryContext(ctx, query, args)
+	}
+	return nil, ErrUnsupportedMethod
 }
 
 // Close closes the statement.
@@ -763,4 +874,5 @@ const DriverName = "rdsmysql"
 
 func init() {
 	sql.Register(DriverName, &db{})
+	globalTopologyMap = make(map[string][]string)
 }

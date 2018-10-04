@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"sync"
 	"testing"
 )
 
@@ -53,6 +54,37 @@ func TestDriver(t *testing.T) {
 			t.Fatal("should have returned a value")
 		}
 	}
+}
+
+func TestDriverMultiple(t *testing.T) {
+	count := 10
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			db, err := sql.Open(DriverName, "root:@localhost/mysql")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			res, err := db.Query("select now()")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Close()
+			for res.Next() {
+				var val sql.NullString
+				if err := res.Scan(&val); err != nil {
+					t.Fatal(err)
+				}
+				if !val.Valid {
+					t.Fatal("should have returned a value")
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestDriverPasswordEscape(t *testing.T) {

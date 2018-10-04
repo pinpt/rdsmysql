@@ -117,7 +117,10 @@ func (s *topology) ExecuteOnLeaveIfNeeded() {
 	}
 }
 
-func (s *topology) SetAvailableFromReplicaHostStatus(current []string) {
+func (s *topology) SetAvailableFromReplicaHostStatus(hostname string, current []string) {
+	globalTopologyLock.Lock()
+	globalTopologyMap[hostname] = current
+	defer globalTopologyLock.Unlock()
 	now := s.opts.Now()
 
 	s.availableReplicaHostStatus = map[string]bool{}

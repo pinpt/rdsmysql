@@ -18,13 +18,13 @@ func TestTopologyLeft(t *testing.T) {
 		},
 	})
 	now = date(1, 1)
-	s.SetAvailableFromReplicaHostStatus([]string{"a", "b", "c"})
+	s.SetAvailableFromReplicaHostStatus("a", []string{"a", "b", "c"})
 	assertEq(t,
 		[]string{"a", "b", "c"},
 		s.GetAvailable())
 
 	now = date(1, 2)
-	s.SetAvailableFromReplicaHostStatus([]string{"a", "b"})
+	s.SetAvailableFromReplicaHostStatus("a", []string{"a", "b"})
 	assertEq(t,
 		[]string{"a", "b"},
 		s.GetAvailable())
@@ -51,13 +51,13 @@ func TestTopologyLeavingAndBack(t *testing.T) {
 		},
 	})
 	now = date(1, 1)
-	s.SetAvailableFromReplicaHostStatus([]string{"a", "b", "c"})
+	s.SetAvailableFromReplicaHostStatus("a", []string{"a", "b", "c"})
 	assertEq(t,
 		[]string{"a", "b", "c"},
 		s.GetAvailable())
 
 	now = date(1, 2)
-	s.SetAvailableFromReplicaHostStatus([]string{"a", "b"})
+	s.SetAvailableFromReplicaHostStatus("a", []string{"a", "b"})
 	assertEq(t,
 		[]string{"a", "b"},
 		s.GetAvailable())
@@ -67,7 +67,7 @@ func TestTopologyLeavingAndBack(t *testing.T) {
 	assertEq(t, 0, len(left), "none left")
 
 	now = date(1, 4)
-	s.SetAvailableFromReplicaHostStatus([]string{"a", "b", "c"})
+	s.SetAvailableFromReplicaHostStatus("a", []string{"a", "b", "c"})
 	assertEq(t,
 		[]string{"a", "b", "c"},
 		s.GetAvailable())
@@ -92,7 +92,7 @@ func TestTopologyMarkFailedAndBack1(t *testing.T) {
 	})
 
 	now = date(1, 1)
-	s.SetAvailableFromReplicaHostStatus([]string{"a", "b", "c"})
+	s.SetAvailableFromReplicaHostStatus("a", []string{"a", "b", "c"})
 	assertEq(t,
 		[]string{"a", "b", "c"},
 		s.GetAvailable())
@@ -130,10 +130,10 @@ func TestTopologyMarkFailedAndBack2(t *testing.T) {
 	})
 
 	now = date(1, 1)
-	s.SetAvailableFromReplicaHostStatus([]string{"a"})
+	s.SetAvailableFromReplicaHostStatus("a", []string{"a"})
 	s.MarkFailed("a")
 	now = date(1, 2)
-	s.SetAvailableFromReplicaHostStatus([]string{"a", "b"})
+	s.SetAvailableFromReplicaHostStatus("a", []string{"a", "b"})
 	assertEq(t,
 		[]string{"b"},
 		s.GetAvailable())
@@ -155,7 +155,7 @@ func TestTopologyMarkFailedMultiple(t *testing.T) {
 	})
 
 	now = date(1, 0)
-	s.SetAvailableFromReplicaHostStatus([]string{"a", "b"})
+	s.SetAvailableFromReplicaHostStatus("a", []string{"a", "b"})
 	now = date(1, 1)
 	s.MarkFailed("b")
 	now = date(1, 5)
