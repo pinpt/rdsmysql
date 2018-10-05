@@ -13,6 +13,7 @@ import (
 	"math"
 	"math/rand"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +55,9 @@ var ErrUnsupportedMethod = errors.New("unsupported method")
 
 // MaxServersTriedForQuery is the max number of servers tried for a query. The actual number of retries is +1 since it tries to connect to initial instance twice.
 const MaxServersTriedForQuery = 3
+
+// MaxConnectAttempts is the max number of tries to connect to a server
+const MaxConnectAttempts = 10
 
 // Logger is the fundamental interface for all log operations. Log creates a
 // log event from keyvals, a variadic sequence of alternating keys and values.
@@ -160,8 +164,10 @@ func (d *db) Open(name string) (driver.Conn, error) {
 		}
 	}
 	dbname := u.EscapedPath()
-	if dbname[0] == '/' {
-		dbname = dbname[1:]
+	if dbname != "" {
+		if dbname[0] == '/' {
+			dbname = dbname[1:]
+		}
 	}
 	q := u.Query()
 	maxTimeLeaving, err := parseDuration("max-time-leaving", q, defaultMaxTimeLeaving)
@@ -209,12 +215,7 @@ func (d *db) Open(name string) (driver.Conn, error) {
 				return
 			}
 			go func(db driver.Conn) {
-				// do not block
-				if d, ok := db.(TrackedConn); ok {
-					d.Terminate()
-				} else {
-					db.Close()
-				}
+				db.Close()
 			}(conn.connections[id])
 			delete(conn.connections, id)
 		},
@@ -234,19 +235,13 @@ func (d *db) Open(name string) (driver.Conn, error) {
 // Terminate will forceably shutdown the connection and close all db
 func (c *connection) Terminate() {
 	L.Log("msg", "terminate", "hostname", c.hostname)
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.topologyUpdates.Stop()
-	globalTopologyLock.Lock()
-	globalTopologyRetrievalLock.Lock()
-	defer globalTopologyLock.Unlock()
-	defer globalTopologyRetrievalLock.Lock()
-	delete(globalTopologyMap, c.hostname)
-	for k, conn := range c.connections {
-		delete(globalTopologyMap, k)
+	c.mu.Lock()
+	for _, conn := range c.connections {
 		conn.Close()
 	}
 	c.connections = nil
+	c.mu.Unlock()
 }
 
 func (c *connection) updateTopology() error {
@@ -260,9 +255,7 @@ func (c *connection) updateTopology() error {
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
 	c.topology.SetAvailableFromReplicaHostStatus(c.hostname, res)
-	c.mu.Unlock()
 	return nil
 }
 
@@ -274,9 +267,7 @@ func (c *connection) setupTopologyTicker() {
 			select {
 			case <-c.topologyUpdates.ticker.C:
 				c.updateTopology()
-				c.mu.Lock()
 				c.topology.ExecuteOnLeaveIfNeeded()
-				c.mu.Unlock()
 			case <-c.topologyUpdates.stop:
 				break LOOP
 			}
@@ -318,7 +309,18 @@ func (c *connection) getConnection(hostname string) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return mysqlDriver.Open(dsn)
+	L.Log("msg", "new connection", "hostname", hostname)
+	for i := 0; i < MaxConnectAttempts+1; i++ {
+		conn, err := mysqlDriver.Open(dsn)
+		if err != nil {
+			if isExecRetryable(err) {
+				exponentialBackoff(i + 1)
+				continue
+			}
+		}
+		return conn, err
+	}
+	return nil, ErrConnectMaxRetriesExceeded
 }
 
 const maxReplicaLagMs = 100
@@ -380,38 +382,23 @@ func (c *connection) retrieveTopology(conn driver.Conn) ([]string, error) {
 	return res, nil
 }
 
-var globalTopologyLock sync.RWMutex
-var globalTopologyRetrievalLock sync.Mutex
-var globalTopologyMap map[string][]string
-
 // updateTopologyInitial will fetch the initial topology
 func (c *connection) updateTopologyInitial() error {
-	// first check the global topology map so we can share them
-	globalTopologyLock.RLock()
-	found, ok := globalTopologyMap[c.hostname]
-	if ok {
-		globalTopologyLock.RUnlock()
-		c.topology.SetAvailableFromReplicaHostStatus(c.hostname, found)
+	for i := 0; i < MaxRetries+1; i++ {
+		conn, err := c.getConnection(c.hostname)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		res, err := c.retrieveTopology(conn)
+		if err != nil {
+			return err
+		}
+		L.Log("msg", "updating topology initial", "servers", res, "hostname", c.hostname)
+		c.topology.SetAvailableFromReplicaHostStatus(c.hostname, res)
 		return nil
 	}
-	globalTopologyLock.RUnlock()
-	conn, err := c.getConnection(c.hostname)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	globalTopologyRetrievalLock.Lock()
-	defer globalTopologyRetrievalLock.Unlock()
-	res, err := c.retrieveTopology(conn)
-	if err != nil {
-		return err
-	}
-	c.mu.Lock()
-	L.Log("msg", "updating topology initial", "servers", res, "hostname", c.hostname)
-	c.topology.SetAvailableFromReplicaHostStatus(c.hostname, res)
-	globalTopologyMap[c.hostname] = res
-	c.mu.Unlock()
-	return nil
+	return ErrConnectMaxRetriesExceeded
 }
 
 func randn(maxNotInclusive int) int {
@@ -436,13 +423,10 @@ func (c *connection) getMaster() (driver.Conn, error) {
 
 // getReplica returns an available replica out of random selection if more than 1
 func (c *connection) getReplica() (driver.Conn, string, error) {
-	c.mu.Lock()
 	available := c.topology.GetAvailable()
-	c.mu.Unlock()
+	empty := available == nil || len(available) == 0
 
-	L.Log("msg", "get replica", "available", available)
-
-	if available == nil || len(available) == 0 {
+	if empty {
 		// attempt to use the master if no replicas are available
 		L.Log("msg", "no replicas found, will attempt to use the master")
 		conn, err := c.getMaster()
@@ -456,26 +440,30 @@ func (c *connection) getReplica() (driver.Conn, string, error) {
 	}
 
 	var hostname string
-	if len(available) > 1 {
-		// randomize our hostname is more than one
-		hostname = available[randn(len(available))]
-	} else {
-		hostname = available[0]
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	db, ok := c.connections[hostname]
-	if !ok {
-		conn, err := c.getConnection(hostname)
-		if err != nil {
-			return nil, "", err
+	for len(available) > 0 {
+		if len(available) > 1 {
+			// randomize our hostname is more than one
+			hostname = available[randn(len(available))]
+		} else {
+			hostname = available[0]
 		}
-		c.connections[hostname] = conn
-		db = conn
+		c.mu.Lock()
+		db, ok := c.connections[hostname]
+		c.mu.Unlock()
+		if !ok {
+			conn, err := c.getConnection(hostname)
+			if err != nil {
+				return nil, "", err
+			}
+			c.mu.Lock()
+			c.connections[hostname] = conn
+			c.mu.Unlock()
+			db = conn
+		}
+		return db, hostname, nil
 	}
-	return db, hostname, nil
+
+	return nil, "", ErrNoServersAvailable
 }
 
 // Prepare returns a prepared statement, bound to this connection.
@@ -497,6 +485,7 @@ func (c *connection) PrepareContext(ctx context.Context, query string) (driver.S
 // do their own connection caching.
 func (c *connection) Close() error {
 	// don't shutdown the connection, we'll internally handle it
+	c.Terminate()
 	return nil
 }
 
@@ -541,9 +530,7 @@ func (c *connection) BeginTx(ctx context.Context, opts driver.TxOptions) (driver
 // the connection from being returned to the connection pool. Any other
 // error will be discarded.
 func (c *connection) ResetSession(ctx context.Context) error {
-	// NOTE: we return ErrBadConn to prevent caching in the SQL package so that we can
-	// do our own caching internally
-	return driver.ErrBadConn
+	return nil
 }
 
 // Pinger is an optional interface that may be implemented by a Conn.
@@ -574,14 +561,26 @@ func (c *connection) Ping(ctx context.Context) error {
 //
 // Deprecated: Drivers should implement ExecerContext instead.
 func (c *connection) Exec(query string, args []driver.Value) (driver.Result, error) {
-	conn, err := c.getMaster()
-	if err != nil {
-		return nil, err
+	for i := 0; i < MaxServersTriedForQuery+1; i++ {
+		conn, err := c.getMaster()
+		if err != nil {
+			if err == ErrNoServersAvailable || isExecRetryable(err) {
+				exponentialBackoff(i + 1)
+				continue
+			}
+			return nil, err
+		}
+		if mc, ok := conn.(driver.Execer); ok {
+			res, err := mc.Exec(query, args)
+			if isExecRetryable(err) {
+				exponentialBackoff(i + 1)
+				continue
+			}
+			return res, err
+		}
+		return nil, ErrUnsupportedMethod
 	}
-	if mc, ok := conn.(driver.Execer); ok {
-		return mc.Exec(query, args)
-	}
-	return nil, ErrUnsupportedMethod
+	return nil, ErrExecMaxRetriesExceeded
 }
 
 // ExecerContext is an optional interface that may be implemented by a Conn.
@@ -595,14 +594,26 @@ func (c *connection) Exec(query string, args []driver.Value) (driver.Result, err
 //
 // ExecerContext must honor the context timeout and return when the context is canceled.
 func (c *connection) ExecContext(ctx context.Context, query string, nargs []driver.NamedValue) (driver.Result, error) {
-	conn, err := c.getMaster()
-	if err != nil {
-		return nil, err
+	for i := 0; i < MaxServersTriedForQuery+1; i++ {
+		conn, err := c.getMaster()
+		if err != nil {
+			if err == ErrNoServersAvailable || isExecRetryable(err) {
+				exponentialBackoff(i + 1)
+				continue
+			}
+			return nil, err
+		}
+		if mc, ok := conn.(driver.ExecerContext); ok {
+			res, err := mc.ExecContext(ctx, query, nargs)
+			if isExecRetryable(err) {
+				exponentialBackoff(i + 1)
+				continue
+			}
+			return res, err
+		}
+		return nil, ErrUnsupportedMethod
 	}
-	if mc, ok := conn.(driver.ExecerContext); ok {
-		return mc.ExecContext(ctx, query, nargs)
-	}
-	return nil, ErrUnsupportedMethod
+	return nil, ErrExecMaxRetriesExceeded
 }
 
 // Queryer is an optional interface that may be implemented by a Conn.
@@ -615,14 +626,27 @@ func (c *connection) ExecContext(ctx context.Context, query string, nargs []driv
 //
 // Deprecated: Drivers should implement QueryerContext instead.
 func (c *connection) Query(query string, args []driver.Value) (driver.Rows, error) {
-	conn, _, err := c.getReplica()
-	if err != nil {
-		return nil, err
+	for i := 0; i < MaxServersTriedForQuery+1; i++ {
+		conn, hostname, err := c.getReplica()
+		if err != nil {
+			if err == ErrNoServersAvailable {
+				continue
+			}
+			return nil, err
+		}
+		if s, ok := conn.(driver.Queryer); ok {
+			rows, err := s.Query(query, args)
+			if isQueryRetryable(err) {
+				// on an error, mark it as closed
+				c.topology.MarkFailed(hostname)
+				exponentialBackoff(i + 1)
+				continue
+			}
+			return rows, err
+		}
+		return nil, ErrUnsupportedMethod
 	}
-	if s, ok := conn.(driver.Queryer); ok {
-		return s.Query(query, args)
-	}
-	return nil, ErrUnsupportedMethod
+	return nil, ErrConnectMaxRetriesExceeded
 }
 
 // QueryerContext is an optional interface that may be implemented by a Conn.
@@ -636,14 +660,27 @@ func (c *connection) Query(query string, args []driver.Value) (driver.Rows, erro
 //
 // QueryerContext must honor the context timeout and return when the context is canceled.
 func (c *connection) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	conn, _, err := c.getReplica()
-	if err != nil {
-		return nil, err
+	for i := 0; i < MaxServersTriedForQuery+1; i++ {
+		conn, hostname, err := c.getReplica()
+		if err != nil {
+			if err == ErrNoServersAvailable {
+				continue
+			}
+			return nil, err
+		}
+		if s, ok := conn.(driver.QueryerContext); ok {
+			rows, err := s.QueryContext(ctx, query, args)
+			if isQueryRetryable(err) {
+				// on an error, mark it as closed
+				c.topology.MarkFailed(hostname)
+				exponentialBackoff(i + 1)
+				continue
+			}
+			return rows, err
+		}
+		return nil, ErrUnsupportedMethod
 	}
-	if s, ok := conn.(driver.QueryerContext); ok {
-		return s.QueryContext(ctx, query, args)
-	}
-	return nil, ErrUnsupportedMethod
+	return nil, ErrConnectMaxRetriesExceeded
 }
 
 // Close closes the statement.
@@ -692,25 +729,36 @@ func (s *statement) Query(args []driver.Value) (driver.Rows, error) {
 		} else {
 			st, err = conn.Prepare(s.query)
 		}
-		if err != nil {
-			return nil, err
+		if s.checkForRetry(i, hostname, conn, st, err) {
+			continue
 		}
 		s.parent = st
 		rows, err := st.Query(args)
-		if err != nil {
-			st.Close()
-			s.parent = nil
-			if _, ok := err.(*mysql.MySQLError); ok {
-				return nil, err
-			}
-			// on an error, mark it as closed
-			s.conn.mu.Lock()
-			s.conn.topology.MarkFailed(hostname)
-			s.conn.mu.Unlock()
+		if s.checkForRetry(i, hostname, conn, st, err) {
+			continue
 		}
-		return rows, nil
+		return rows, err
 	}
 	return nil, ErrConnectMaxRetriesExceeded
+}
+
+func (s *statement) checkForRetry(i int, hostname string, conn driver.Conn, st driver.Stmt, err error) bool {
+	if isQueryRetryable(err) {
+		s.conn.mu.Lock()
+		if st != nil {
+			st.Close()
+		}
+		if conn != nil {
+			conn.Close()
+		}
+		s.parent = nil
+		s.conn.mu.Unlock()
+		// on an error, mark it as closed
+		s.conn.topology.MarkFailed(hostname)
+		exponentialBackoff(i + 1)
+		return true
+	}
+	return false
 }
 
 // QueryContext executes a query that may return rows, such as a
@@ -725,7 +773,7 @@ func (s *statement) QueryContext(ctx context.Context, nargs []driver.NamedValue)
 	for i := 0; i < MaxServersTriedForQuery+1; i++ {
 		select {
 		case <-ctx.Done():
-			return nil, nil
+			return nil, driver.ErrSkip
 		default:
 			break
 		}
@@ -742,26 +790,15 @@ func (s *statement) QueryContext(ctx context.Context, nargs []driver.NamedValue)
 		} else {
 			st, err = conn.Prepare(s.query)
 		}
-		if err != nil {
-			return nil, err
+		if s.checkForRetry(i, hostname, conn, st, err) {
+			continue
 		}
 		s.parent = st
 		rows, err := st.Query(args)
-		if err != nil {
-			st.Close()
-			s.parent = nil
-			if _, ok := err.(*mysql.MySQLError); ok {
-				return nil, err
-			}
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			// on an error, mark it as closed
-			s.conn.mu.Lock()
-			s.conn.topology.MarkFailed(hostname)
-			s.conn.mu.Unlock()
+		if s.checkForRetry(i, hostname, conn, st, err) {
+			continue
 		}
-		return rows, nil
+		return rows, err
 	}
 	return nil, ErrConnectMaxRetriesExceeded
 }
@@ -787,7 +824,7 @@ func (s *statement) Exec(args []driver.Value) (driver.Result, error) {
 	s.parent = st
 	for i := 0; i < MaxRetries; i++ {
 		res, err := st.Exec(args)
-		if IsRetryable(err) {
+		if isExecRetryable(err) {
 			exponentialBackoff(i + 1)
 			continue
 		}
@@ -826,7 +863,7 @@ func (s *statement) ExecContext(ctx context.Context, nargs []driver.NamedValue) 
 		} else {
 			res, err = st.Exec(args)
 		}
-		if IsRetryable(err) {
+		if isExecRetryable(err) {
 			exponentialBackoff(i + 1)
 			continue
 		}
@@ -850,9 +887,18 @@ func namedValueToValue(named []driver.NamedValue) ([]driver.Value, error) {
 // MaxRetries is the max number of times that a deadlock query will be retried
 var MaxRetries = 3
 
-// IsRetryable returns true if the sql error passed in a retryable error
-func IsRetryable(err error) bool {
+func isInvalidConnection(err error) bool {
+	return err == mysql.ErrInvalidConn || err.Error() == "invalid connection" || strings.Contains(err.Error(), "connection refused")
+}
+
+func isExecRetryable(err error) bool {
 	if err != nil {
+		if err == driver.ErrSkip {
+			return false
+		}
+		if isInvalidConnection(err) || err == sql.ErrConnDone || err == driver.ErrBadConn {
+			return true
+		}
 		if strings.Contains(err.Error(), "Error 1213: Deadlock found when trying to get lock") {
 			// this is a retryable query
 			return true
@@ -861,11 +907,27 @@ func IsRetryable(err error) bool {
 	return false
 }
 
+func isQueryRetryable(err error) bool {
+	if err != nil {
+		if err == driver.ErrSkip {
+			return false
+		}
+		fmt.Println("[DEBUG] err detected in query", err, ">>>", err.Error(), ">>> type", reflect.TypeOf(err))
+		if isInvalidConnection(err) || err == sql.ErrConnDone || err == driver.ErrBadConn || err == io.EOF {
+			return true
+		}
+	}
+	return false
+}
+
 func exponentialBackoffValue(retryCount int) time.Duration {
-	return time.Millisecond * 100 * time.Duration(math.Pow(2, float64(retryCount)))
+	return time.Millisecond * 200 * time.Duration(math.Pow(2, float64(retryCount)))
 }
 
 func exponentialBackoff(retryCount int) {
+	if retryCount == 0 {
+		retryCount = 1
+	}
 	time.Sleep(exponentialBackoffValue(retryCount))
 }
 
@@ -874,5 +936,4 @@ const DriverName = "rdsmysql"
 
 func init() {
 	sql.Register(DriverName, &db{})
-	globalTopologyMap = make(map[string][]string)
 }

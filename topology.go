@@ -2,6 +2,7 @@ package rdsmysql
 
 import (
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -37,6 +38,8 @@ type topology struct {
 	// When a node is marked as failed, it acts as if it is not returned from initial list of replicas for FailDuration time. OnLeave is called after MaxTimeLeaving if it is < FailDuration.
 	// map[server_id]lastFailed
 	failed map[string]time.Time
+
+	mu sync.Mutex
 }
 
 // newTopology creates a new topology state manager
@@ -54,6 +57,8 @@ func newTopology(opts topologyOpts) *topology {
 
 func (s *topology) GetAvailable() []string {
 	now := s.opts.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	notFailed := map[string]bool{}
 	for c := range s.availableReplicaHostStatus {
@@ -108,6 +113,7 @@ func (s *topology) GetAvailable() []string {
 func (s *topology) ExecuteOnLeaveIfNeeded() {
 	now := s.opts.Now()
 
+	s.mu.Lock()
 	for c, startedLeaving := range s.leaving {
 		if startedLeaving.Before(now.Add(-s.opts.MaxTimeLeaving)) {
 			s.opts.Logger.Log("msg", "host left", "hostname", c)
@@ -115,24 +121,26 @@ func (s *topology) ExecuteOnLeaveIfNeeded() {
 			delete(s.leaving, c)
 		}
 	}
+	s.mu.Unlock()
 }
 
 func (s *topology) SetAvailableFromReplicaHostStatus(hostname string, current []string) {
-	globalTopologyLock.Lock()
-	globalTopologyMap[hostname] = current
-	defer globalTopologyLock.Unlock()
 	now := s.opts.Now()
 
+	s.mu.Lock()
 	s.availableReplicaHostStatus = map[string]bool{}
 	for _, c := range current {
 		s.availableReplicaHostStatus[c] = true
 	}
 	s.availableReplicaHostStatusUpdated = now
+	s.mu.Unlock()
 }
 
 func (s *topology) MarkFailed(host string) {
 	s.opts.Logger.Log("msg", "marking host as failed", "hostname", host)
 	now := s.opts.Now()
+	s.mu.Lock()
 	s.failed[host] = now
 	s.leaving[host] = now
+	s.mu.Unlock()
 }

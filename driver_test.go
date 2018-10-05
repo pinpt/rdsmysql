@@ -57,7 +57,7 @@ func TestDriver(t *testing.T) {
 }
 
 func TestDriverMultiple(t *testing.T) {
-	count := 10
+	count := 100
 	var wg sync.WaitGroup
 	for i := 0; i < count; i++ {
 		wg.Add(1)
