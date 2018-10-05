@@ -108,6 +108,7 @@ func loadQuery(ctx context.Context, db *sql.DB) {
 		}
 		panic(err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var f1 string
 		err := rows.Scan(&f1)
@@ -120,14 +121,15 @@ func loadQuery(ctx context.Context, db *sql.DB) {
 			panic(err)
 		}
 	}
-	rows.Close()
 }
 
 func setupSchema(db *sql.DB) {
-	db.Exec(`
+	if _, err := db.Exec(`
 		DROP TABLE IF EXISTS table1;
 		CREATE TABLE table1(id varchar(16) primary key, parent varchar(16), f1 text);
-	`)
+	`); err != nil {
+		panic(err)
+	}
 }
 
 func dropSchema(db *sql.DB) {
@@ -182,6 +184,11 @@ func main() {
 	if debug {
 		rdsmysql.L = &logger{}
 	}
+	if strings.Contains(args[0], "?") {
+		args[0] = args[0] + "&multiStatements=true"
+	} else {
+		args[0] = args[0] + "?multiStatements=true"
+	}
 	db, err := sql.Open(rdsmysql.DriverName, args[0])
 	if err != nil {
 		fmt.Println(err)
@@ -200,7 +207,6 @@ func main() {
 			break
 		}
 	}()
-	defer close(c)
 	if load {
 		setupSchema(db)
 		insertDataBatch(db)

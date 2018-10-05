@@ -9,9 +9,12 @@ import (
 )
 
 type testLogger struct {
+	mu sync.Mutex
 }
 
 func (l *testLogger) Log(keyvals ...interface{}) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	kv := make(map[interface{}]interface{})
 	for i := 0; i < len(keyvals); i += 2 {
 		k := keyvals[i]
@@ -67,6 +70,7 @@ func TestDriverMultiple(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			db.SetMaxOpenConns(1)
 			defer db.Close()
 			res, err := db.Query("select now()")
 			if err != nil {

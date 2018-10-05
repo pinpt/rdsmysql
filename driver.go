@@ -13,7 +13,6 @@ import (
 	"math"
 	"math/rand"
 	"net/url"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,10 +94,19 @@ type connection struct {
 	userinfo        *url.Userinfo
 	updateDuration  time.Duration
 	topologyUpdates *ticker
+	noreplicas      bool
 }
 
-// make sure our connection implements the full driver.Conn interface
+// make sure our connection implements the full driver.Conn interfaces
 var _ driver.Conn = (*connection)(nil)
+var _ driver.Queryer = (*connection)(nil)
+var _ driver.QueryerContext = (*connection)(nil)
+var _ driver.Execer = (*connection)(nil)
+var _ driver.ExecerContext = (*connection)(nil)
+var _ driver.Pinger = (*connection)(nil)
+var _ driver.ConnBeginTx = (*connection)(nil)
+var _ driver.SessionResetter = (*connection)(nil)
+var _ driver.ConnPrepareContext = (*connection)(nil)
 
 type statement struct {
 	query  string
@@ -107,8 +115,10 @@ type statement struct {
 	ctx    context.Context
 }
 
-// make sure our statement implements the full driver.Stmt interface
+// make sure our statement implements the full driver.Stmt interfaces
 var _ driver.Stmt = (*statement)(nil)
+var _ driver.StmtExecContext = (*statement)(nil)
+var _ driver.StmtQueryContext = (*statement)(nil)
 
 var mysqlDriver = &mysql.MySQLDriver{}
 
@@ -360,6 +370,9 @@ func (c *connection) retrieveTopology(conn driver.Conn) ([]string, error) {
 	}
 	defer stmt.Close()
 	rows, err := stmt.Query(nil)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var res []string
 	for {
@@ -408,14 +421,16 @@ func randn(maxNotInclusive int) int {
 // getMaster returns the master connection
 func (c *connection) getMaster() (driver.Conn, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	db, ok := c.connections[c.hostname]
+	c.mu.Unlock()
 	if !ok {
 		conn, err := c.getConnection(c.hostname)
 		if err != nil {
 			return nil, err
 		}
+		c.mu.Lock()
 		c.connections[c.hostname] = conn
+		c.mu.Unlock()
 		db = conn
 	}
 	return db, nil
@@ -428,7 +443,11 @@ func (c *connection) getReplica() (driver.Conn, string, error) {
 
 	if empty {
 		// attempt to use the master if no replicas are available
-		L.Log("msg", "no replicas found, will attempt to use the master")
+		if !c.noreplicas {
+			// only show it once for a connection
+			L.Log("msg", "no replicas found, will attempt to use the master")
+			c.noreplicas = true
+		}
 		conn, err := c.getMaster()
 		if err != nil {
 			return nil, "", err
@@ -710,6 +729,23 @@ func (s *statement) NumInput() int {
 	return s.parent.NumInput()
 }
 
+func (s *statement) checkForRetry(i int, hostname string, conn driver.Conn, st driver.Stmt, err error) bool {
+	if isQueryRetryable(err) {
+		if st != nil {
+			st.Close()
+		}
+		if conn != nil {
+			conn.Close()
+		}
+		s.parent = nil
+		// on an error, mark it as closed
+		s.conn.topology.MarkFailed(hostname)
+		exponentialBackoff(i + 1)
+		return true
+	}
+	return false
+}
+
 // Query executes a query that may return rows, such as a
 // SELECT.
 //
@@ -732,6 +768,9 @@ func (s *statement) Query(args []driver.Value) (driver.Rows, error) {
 		if s.checkForRetry(i, hostname, conn, st, err) {
 			continue
 		}
+		if err != nil {
+			return nil, err
+		}
 		s.parent = st
 		rows, err := st.Query(args)
 		if s.checkForRetry(i, hostname, conn, st, err) {
@@ -740,25 +779,6 @@ func (s *statement) Query(args []driver.Value) (driver.Rows, error) {
 		return rows, err
 	}
 	return nil, ErrConnectMaxRetriesExceeded
-}
-
-func (s *statement) checkForRetry(i int, hostname string, conn driver.Conn, st driver.Stmt, err error) bool {
-	if isQueryRetryable(err) {
-		s.conn.mu.Lock()
-		if st != nil {
-			st.Close()
-		}
-		if conn != nil {
-			conn.Close()
-		}
-		s.parent = nil
-		s.conn.mu.Unlock()
-		// on an error, mark it as closed
-		s.conn.topology.MarkFailed(hostname)
-		exponentialBackoff(i + 1)
-		return true
-	}
-	return false
 }
 
 // QueryContext executes a query that may return rows, such as a
@@ -792,6 +812,9 @@ func (s *statement) QueryContext(ctx context.Context, nargs []driver.NamedValue)
 		}
 		if s.checkForRetry(i, hostname, conn, st, err) {
 			continue
+		}
+		if err != nil {
+			return nil, err
 		}
 		s.parent = st
 		rows, err := st.Query(args)
@@ -896,7 +919,7 @@ func isExecRetryable(err error) bool {
 		if err == driver.ErrSkip {
 			return false
 		}
-		if isInvalidConnection(err) || err == sql.ErrConnDone || err == driver.ErrBadConn {
+		if isInvalidConnection(err) || err == sql.ErrConnDone || err == driver.ErrBadConn || err == io.EOF {
 			return true
 		}
 		if strings.Contains(err.Error(), "Error 1213: Deadlock found when trying to get lock") {
@@ -912,7 +935,7 @@ func isQueryRetryable(err error) bool {
 		if err == driver.ErrSkip {
 			return false
 		}
-		fmt.Println("[DEBUG] err detected in query", err, ">>>", err.Error(), ">>> type", reflect.TypeOf(err))
+		// fmt.Println("[DEBUG] err detected in query", err, ">>>", err.Error(), ">>> type", reflect.TypeOf(err))
 		if isInvalidConnection(err) || err == sql.ErrConnDone || err == driver.ErrBadConn || err == io.EOF {
 			return true
 		}
