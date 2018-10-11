@@ -288,6 +288,13 @@ func (c *connection) setupTopologyTicker() {
 
 // GetDSN is a helper for getting the DSN to mysql
 func GetDSN(hostname string, port int, username string, password string, name string, args url.Values) (string, error) {
+	// args are modified below (setting tls)
+	// to prevent concurrent modifications create a full copy
+	args, err := url.ParseQuery(args.Encode())
+	if err != nil {
+		return "", nil
+	}
+
 	if strings.Contains(hostname, "rds.amazonaws.com") {
 		caCertPool := x509.NewCertPool()
 		if !caCertPool.AppendCertsFromPEM([]byte(mysqlRDSCACert)) {
