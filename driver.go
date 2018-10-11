@@ -40,6 +40,9 @@ const defaultMaxTimeLeaving = 3 * 60 * time.Second
 // It takes about ~4 min to a host to be removed from information_schema.replica_host_status after shutdown and first failed query.
 const defaultFailDuration = 4 * 60 * time.Second
 
+// defaultConnectTimeout is the duration the client will wait for connection to database before timing out
+const defaultConnectTimeout = 5 * time.Second
+
 // ErrNoServersAvailable is returned from Query when no servers are available. All servers returned from information_schema.replica_host_status failed.
 var ErrNoServersAvailable = errors.New("no servers available")
 
@@ -56,7 +59,7 @@ var ErrUnsupportedMethod = errors.New("unsupported method")
 const MaxServersTriedForQuery = 3
 
 // MaxConnectAttempts is the max number of tries to connect to a server
-const MaxConnectAttempts = 10
+const MaxConnectAttempts = 3
 
 // Logger is the fundamental interface for all log operations. Log creates a
 // log event from keyvals, a variadic sequence of alternating keys and values.
@@ -322,6 +325,9 @@ func GetDSN(hostname string, port int, username string, password string, name st
 
 func (c *connection) getConnection(hostname string) (driver.Conn, error) {
 	pass, _ := c.userinfo.Password()
+	if tv := c.args.Get("timeout"); tv == "" {
+		c.args.Set("timeout", defaultConnectTimeout.String())
+	}
 	dsn, err := GetDSN(hostname, c.port, c.userinfo.Username(), pass, c.database, c.args)
 	if err != nil {
 		return nil, err
@@ -329,11 +335,8 @@ func (c *connection) getConnection(hostname string) (driver.Conn, error) {
 	L.Log("msg", "new connection", "hostname", hostname)
 	for i := 0; i < MaxConnectAttempts+1; i++ {
 		conn, err := mysqlDriver.Open(dsn)
-		if err != nil {
-			if isExecRetryable(err) {
-				exponentialBackoff(i + 1)
-				continue
-			}
+		if isExecRetryable(err) {
+			continue
 		}
 		return conn, err
 	}
