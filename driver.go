@@ -14,7 +14,6 @@ import (
 	"math/rand"
 	"net"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -228,23 +227,12 @@ func (d *db) Open(name string) (driver.Conn, error) {
 		MaxTimeLeaving: maxTimeLeaving,
 		OnFound: func(id string) {
 			L.Log("msg", "database server found", "id", id)
-			serverStatsMu.Lock()
-			if _, ok := serverStats[id]; !ok {
-				serverStats[id] = 0
-			}
-			serverStatsMu.Unlock()
 		},
 		OnFailed: func(id string) {
 			L.Log("msg", "database server failed", "id", id)
-			serverStatsMu.Lock()
-			delete(serverStats, id)
-			serverStatsMu.Unlock()
 		},
 		OnLeave: func(id string) {
 			L.Log("msg", "database server leaving", "id", id)
-			serverStatsMu.Lock()
-			delete(serverStats, id)
-			serverStatsMu.Unlock()
 			conn.mu.Lock()
 			defer conn.mu.Unlock()
 			c, ok := conn.connections[id]
@@ -489,18 +477,6 @@ func (c *connection) getMaster() (driver.Conn, error) {
 	return db, nil
 }
 
-var serverStats map[string]int64
-var serverStatsMu sync.RWMutex
-
-type serverStat struct {
-	hostname string
-	value    int64
-}
-
-func (s serverStat) String() string {
-	return fmt.Sprintf("%s/%d", s.hostname, s.value)
-}
-
 func (c *connection) getReplicaCount() int {
 	available := c.topology.GetAvailable()
 	if available == nil {
@@ -534,22 +510,7 @@ func (c *connection) getReplica() (driver.Conn, string, error) {
 	var hostname string
 	for len(available) > 0 {
 		if len(available) > 1 {
-			// load balance our hostname based on least queries sent
-			targets := make([]serverStat, 0)
-			serverStatsMu.RLock()
-			for _, name := range available {
-				val, ok := serverStats[name]
-				if ok {
-					targets = append(targets, serverStat{name, val})
-				}
-			}
-			serverStatsMu.RUnlock()
-			// now sort by least used
-			sort.Slice(targets, func(i, j int) bool {
-				return targets[i].value < targets[j].value
-			})
-			L.Log("msg", "replicas sorted by usage", "stats", targets)
-			hostname = targets[0].hostname
+			hostname = available[randn(len(available))]
 		} else {
 			hostname = available[0]
 		}
@@ -735,13 +696,6 @@ func (c *connection) ExecContext(ctx context.Context, query string, nargs []driv
 	return nil, ErrExecMaxRetriesExceeded
 }
 
-func updateStat(hostname string) {
-	serverStatsMu.Lock()
-	val := serverStats[hostname]
-	serverStats[hostname] = val + 1
-	serverStatsMu.Unlock()
-}
-
 // Queryer is an optional interface that may be implemented by a Conn.
 //
 // If a Conn implements neither QueryerContext nor Queryer,
@@ -772,7 +726,6 @@ func (c *connection) Query(query string, args []driver.Value) (driver.Rows, erro
 				exponentialBackoff(i + 1)
 				continue
 			}
-			updateStat(hostname)
 			return rows, err
 		}
 		return nil, ErrUnsupportedMethod
@@ -812,7 +765,6 @@ func (c *connection) QueryContext(ctx context.Context, query string, args []driv
 				exponentialBackoff(i + 1)
 				continue
 			}
-			updateStat(hostname)
 			return rows, err
 		}
 		return nil, ErrUnsupportedMethod
@@ -899,7 +851,6 @@ func (s *statement) Query(args []driver.Value) (driver.Rows, error) {
 		if s.checkForRetry(i, hostname, conn, st, err) {
 			continue
 		}
-		updateStat(hostname)
 		return rows, err
 	}
 	L.Log("msg", "couldn't find replica for query")
@@ -948,7 +899,6 @@ func (s *statement) QueryContext(ctx context.Context, nargs []driver.NamedValue)
 		if s.checkForRetry(i, hostname, conn, st, err) {
 			continue
 		}
-		updateStat(hostname)
 		return rows, err
 	}
 	L.Log("msg", "couldn't find replica for query")
@@ -1101,6 +1051,5 @@ const DriverName = "rdsmysql"
 
 func init() {
 	profileReg = make(map[string]*tls.Config)
-	serverStats = make(map[string]int64)
 	sql.Register(DriverName, &db{})
 }
