@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -42,6 +43,9 @@ const defaultFailDuration = 4 * 60 * time.Second
 
 // defaultConnectTimeout is the duration the client will wait for connection to database before timing out
 const defaultConnectTimeout = 5 * time.Second
+
+// defaultReadimeout is the duration the client will wait for read buffer
+const defaultReadimeout = 10 * time.Second
 
 // ErrNoServersAvailable is returned from Query when no servers are available. All servers returned from information_schema.replica_host_status failed.
 var ErrNoServersAvailable = errors.New("no servers available")
@@ -123,7 +127,7 @@ var _ driver.Stmt = (*statement)(nil)
 var _ driver.StmtExecContext = (*statement)(nil)
 var _ driver.StmtQueryContext = (*statement)(nil)
 
-var mysqlDriver = &mysql.MySQLDriver{}
+var mysqlDriver mysql.MySQLDriver
 
 func parseDuration(key string, q url.Values, def time.Duration) (time.Duration, error) {
 	val := q.Get(key)
@@ -135,10 +139,12 @@ func parseDuration(key string, q url.Values, def time.Duration) (time.Duration, 
 
 // DefaultDriverOpts are the default driver values if not provided in the DSN
 var DefaultDriverOpts = url.Values{
-	"collation":  {"utf8_unicode_ci"},
-	"charset":    {"utf8mb4"},
-	"parseTime":  {"true"},
-	"autocommit": {"true"},
+	"collation":   {"utf8_unicode_ci"},
+	"charset":     {"utf8mb4"},
+	"parseTime":   {"true"},
+	"autocommit":  {"true"},
+	"timeout":     {defaultConnectTimeout.String()},
+	"readTimeout": {defaultReadimeout.String()},
 }
 
 // TrackedConn is an interface that the conn implementation returned from the Open
@@ -289,6 +295,11 @@ func (c *connection) setupTopologyTicker() {
 	}()
 }
 
+var profileReg map[string]*tls.Config
+var profileMu sync.RWMutex
+
+const rdsHostnamaeSuffix = "rds.amazonaws.com"
+
 // GetDSN is a helper for getting the DSN to mysql
 func GetDSN(hostname string, port int, username string, password string, name string, args url.Values) (string, error) {
 	// args are modified below (setting tls)
@@ -297,20 +308,30 @@ func GetDSN(hostname string, port int, username string, password string, name st
 	if err != nil {
 		return "", nil
 	}
-
-	if strings.Contains(hostname, "rds.amazonaws.com") {
-		caCertPool := x509.NewCertPool()
-		if !caCertPool.AppendCertsFromPEM([]byte(mysqlRDSCACert)) {
-			return "", fmt.Errorf("can't add RDS TLS certs")
-		}
-		config := &tls.Config{
-			ServerName: hostname,
-			RootCAs:    caCertPool,
-		}
+	// if running in AWS RDS, make sure we register the special TLS certs
+	if strings.Contains(hostname, rdsHostnamaeSuffix) {
+		var tlsConfig *tls.Config
 		profile := hex.EncodeToString([]byte(hostname))
-		err := mysql.RegisterTLSConfig(profile, config)
-		if err != nil {
-			return "", err
+		// first check to see if we already have a profile registered for this hostname
+		profileMu.RLock()
+		tlsConfig = profileReg[profile]
+		profileMu.RUnlock()
+		// if not, we need to register it
+		if tlsConfig == nil {
+			profileMu.Lock()
+			caCertPool := x509.NewCertPool()
+			if !caCertPool.AppendCertsFromPEM([]byte(mysqlRDSCACert)) {
+				return "", fmt.Errorf("can't add RDS TLS certs")
+			}
+			tlsConfig = &tls.Config{
+				ServerName: hostname,
+				RootCAs:    caCertPool,
+			}
+			err := mysql.RegisterTLSConfig(profile, tlsConfig)
+			if err != nil {
+				return "", err
+			}
+			profileMu.Unlock()
 		}
 		args.Set("tls", profile)
 	}
@@ -325,9 +346,6 @@ func GetDSN(hostname string, port int, username string, password string, name st
 
 func (c *connection) getConnection(hostname string) (driver.Conn, error) {
 	pass, _ := c.userinfo.Password()
-	if tv := c.args.Get("timeout"); tv == "" {
-		c.args.Set("timeout", defaultConnectTimeout.String())
-	}
 	dsn, err := GetDSN(hostname, c.port, c.userinfo.Username(), pass, c.database, c.args)
 	if err != nil {
 		return nil, err
@@ -667,7 +685,9 @@ func (c *connection) Query(query string, args []driver.Value) (driver.Rows, erro
 			rows, err := s.Query(query, args)
 			if isQueryRetryable(err) {
 				// on an error, mark it as closed
-				c.topology.MarkFailed(hostname)
+				if shouldMarkConnectionBad(err) {
+					c.topology.MarkFailed(hostname)
+				}
 				exponentialBackoff(i + 1)
 				continue
 			}
@@ -701,7 +721,9 @@ func (c *connection) QueryContext(ctx context.Context, query string, args []driv
 			rows, err := s.QueryContext(ctx, query, args)
 			if isQueryRetryable(err) {
 				// on an error, mark it as closed
-				c.topology.MarkFailed(hostname)
+				if shouldMarkConnectionBad(err) {
+					c.topology.MarkFailed(hostname)
+				}
 				exponentialBackoff(i + 1)
 				continue
 			}
@@ -749,7 +771,9 @@ func (s *statement) checkForRetry(i int, hostname string, conn driver.Conn, st d
 		}
 		s.parent = nil
 		// on an error, mark it as closed
-		s.conn.topology.MarkFailed(hostname)
+		if shouldMarkConnectionBad(err) {
+			s.conn.topology.MarkFailed(hostname)
+		}
 		exponentialBackoff(i + 1)
 		return true
 	}
@@ -921,7 +945,18 @@ func namedValueToValue(named []driver.NamedValue) ([]driver.Value, error) {
 var MaxRetries = 3
 
 func isInvalidConnection(err error) bool {
-	return err == mysql.ErrInvalidConn || err.Error() == "invalid connection" || strings.Contains(err.Error(), "connection refused")
+	return err == mysql.ErrInvalidConn || err.Error() == "invalid connection" || strings.Contains(err.Error(), "connection refused") || isIOTimeoutError(err)
+}
+
+func isIOTimeoutError(err error) bool {
+	if err, ok := err.(net.Error); ok && err.Timeout() {
+		return true
+	}
+	return false
+}
+
+func shouldMarkConnectionBad(err error) bool {
+	return isInvalidConnection(err) || err == sql.ErrConnDone || err == driver.ErrBadConn || err == io.EOF
 }
 
 func isExecRetryable(err error) bool {
@@ -968,5 +1003,6 @@ func exponentialBackoff(retryCount int) {
 const DriverName = "rdsmysql"
 
 func init() {
+	profileReg = make(map[string]*tls.Config)
 	sql.Register(DriverName, &db{})
 }

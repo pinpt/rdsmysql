@@ -194,7 +194,6 @@ func main() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	db.SetMaxOpenConns(50)
 	defer db.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -213,6 +212,22 @@ func main() {
 		defer dropSchema(db)
 		var wg sync.WaitGroup
 		started := time.Now()
+		go func() {
+			dumpStats := func() {
+				stats := db.Stats()
+				fmt.Printf("[STATS] idle=%d,inuse=%d,open=%d\n", stats.Idle, stats.InUse, stats.OpenConnections)
+			}
+		done:
+			for {
+				select {
+				case <-time.After(10 * time.Second):
+					dumpStats()
+				case <-ctx.Done():
+					break done
+				}
+			}
+			dumpStats()
+		}()
 		for i := 0; i < concurrency; i++ {
 			wg.Add(1)
 			go func(i int) {
