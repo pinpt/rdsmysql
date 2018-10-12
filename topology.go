@@ -10,8 +10,15 @@ import (
 type topologyOpts struct {
 	// MaxTimeLeaving is the max time the server is in leaving state. When this time is exceeded the OnLeave function is called
 	MaxTimeLeaving time.Duration
+
 	// OnLeave function is called when a server is in leaving state longer than MaxTimeLeaving
 	OnLeave func(id string)
+
+	// OnFailed function is called when a server is marked failed
+	OnFailed func(id string)
+
+	// OnFound function is called when a new server is found
+	OnFound func(id string)
 
 	// FailDuration specifies the duration for which MarkFailed is active for
 	FailDuration time.Duration
@@ -131,6 +138,9 @@ func (s *topology) SetAvailableFromReplicaHostStatus(hostname string, current []
 	s.availableReplicaHostStatus = map[string]bool{}
 	for _, c := range current {
 		s.availableReplicaHostStatus[c] = true
+		if s.opts.OnFound != nil {
+			s.opts.OnFound(c)
+		}
 	}
 	s.availableReplicaHostStatusUpdated = now
 	s.mu.Unlock()
@@ -143,4 +153,7 @@ func (s *topology) MarkFailed(host string) {
 	s.failed[host] = now
 	s.leaving[host] = now
 	s.mu.Unlock()
+	if s.opts.OnFailed != nil {
+		s.opts.OnFailed(host)
+	}
 }
