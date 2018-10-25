@@ -312,7 +312,7 @@ func GetDSN(hostname string, port int, username string, password string, name st
 	// to prevent concurrent modifications create a full copy
 	args, err := url.ParseQuery(args.Encode())
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 	// if running in AWS RDS, make sure we register the special TLS certs
 	if strings.Contains(hostname, rdsHostnamaeSuffix) {
