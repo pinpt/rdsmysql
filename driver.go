@@ -139,8 +139,7 @@ func parseDuration(key string, q url.Values, def time.Duration) (time.Duration, 
 
 // DefaultDriverOpts are the default driver values if not provided in the DSN
 var DefaultDriverOpts = url.Values{
-	"collation":   {"utf8_unicode_ci"},
-	"charset":     {"utf8mb4"},
+	"collation":   {"utf8mb4_unicode_ci"},
 	"parseTime":   {"true"},
 	"autocommit":  {"true"},
 	"timeout":     {defaultConnectTimeout.String()},
