@@ -63,7 +63,7 @@ var ErrUnsupportedMethod = errors.New("unsupported method")
 const MaxServersTriedForQuery = 3
 
 // MaxConnectAttempts is the max number of tries to connect to a server
-const MaxConnectAttempts = 3
+const MaxConnectAttempts = 5
 
 // Logger is the fundamental interface for all log operations. Log creates a
 // log event from keyvals, a variadic sequence of alternating keys and values.
@@ -1035,7 +1035,7 @@ func isQueryRetryable(err error) bool {
 }
 
 func exponentialBackoffValue(retryCount int) time.Duration {
-	return time.Millisecond * 200 * time.Duration(math.Pow(2, float64(retryCount)))
+	return time.Millisecond * 250 * time.Duration(math.Pow(2, float64(retryCount)))
 }
 
 func exponentialBackoff(retryCount int) {

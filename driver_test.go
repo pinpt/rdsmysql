@@ -6,6 +6,9 @@ import (
 	"net/url"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 type testLogger struct {
@@ -114,6 +117,22 @@ func TestGetReplicaHostname(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertEq(t, "pinpt-78718787918791-rds-node-1.cyi98989111.us-east-1.rds.amazonaws.com", replica)
+}
+
+func TestExponentialBackoffValue(t *testing.T) {
+	assert := assert.New(t)
+	for _, e := range []struct {
+		in  int
+		out time.Duration
+	}{
+		{1, 500 * time.Millisecond},
+		{2, time.Second},
+		{3, 2 * time.Second},
+		{4, 4 * time.Second},
+		{5, 8 * time.Second},
+	} {
+		assert.Equal(e.out, exponentialBackoffValue(e.in))
+	}
 }
 
 func init() {
