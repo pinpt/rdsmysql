@@ -609,6 +609,12 @@ func (c *connection) BeginTx(ctx context.Context, opts driver.TxOptions) (driver
 // the connection from being returned to the connection pool. Any other
 // error will be discarded.
 func (c *connection) ResetSession(ctx context.Context) error {
+	c.mu.Lock()
+	var good = c.connections != nil
+	c.mu.Unlock()
+	if !good {
+		return driver.ErrBadConn
+	}
 	return nil
 }
 
@@ -991,7 +997,7 @@ func namedValueToValue(named []driver.NamedValue) ([]driver.Value, error) {
 var MaxRetries = 3
 
 func isInvalidConnection(err error) bool {
-	return err == mysql.ErrInvalidConn || err.Error() == "invalid connection" || strings.Contains(err.Error(), "connection refused") || isIOTimeoutError(err) || err == ErrConnectMaxRetriesExceeded
+	return err == mysql.ErrInvalidConn || err.Error() == "invalid connection" || strings.Contains(err.Error(), "connection refused") || isIOTimeoutError(err) || err == ErrConnectMaxRetriesExceeded || err == driver.ErrBadConn
 }
 
 func isIOTimeoutError(err error) bool {
